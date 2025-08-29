@@ -1,115 +1,219 @@
 # Knowledge Base API
 
-A simple REST API for organizing knowledge into hierarchical topics, with JWT authentication and role‑based access control (RBAC).
+Simple knowledge base backend with topics (tree + versioning), resources, and authentication with RBAC. Built with **Node.js + TypeScript + Express**, in-memory **LokiJS** for storage, **JWT** for auth, **Zod** for input validation, and **Jest** for tests. OpenAPI/Swagger docs available.
 
----
+## Quick start
 
-## Getting Started
-
-### Requirements
-- Node.js 18+ and npm
-- (Optional) Docker 24+
-
-### Environment
-The app loads environment variables via `dotenv` and validates them with Zod (`src/config/env.ts`).
-
-Create a local `.env` from the example:
 ```bash
-cp .env.example .env
-# Edit .env and set JWT_SECRET (min. 16 characters)
-```
+# 1) Install
+npm ci
 
-Used variables:
-- `PORT` (default: `3000`)
-- `JWT_SECRET` (**required**, min. 16 characters)
-
----
-
-## Run Locally
-
-### Development
-```bash
-npm install
+# 2) Dev
+export JWT_SECRET=change_me
 npm run dev
-```
 
-### Build & Run
-```bash
+# 3) Prod build + run
 npm run build
+export JWT_SECRET=change_me
 npm start
 ```
 
-**Base URL:** `http://localhost:3000`
+- API base: `http://localhost:3000`
+- Swagger UI: `http://localhost:3000/docs`
+
+> The app fails fast if `JWT_SECRET` is missing.
+
+## Environment variables
+
+You can use a `.env` or `.env.local` (and `.env.test` for tests):
+
+```
+# required
+JWT_SECRET=change_me
+
+# optional
+PORT=3000
+```
+
+## Auth & Roles
+
+- JWT Bearer auth on protected routes: `Authorization: Bearer <token>`
+- Roles: `Admin`, `Editor`, `Viewer`
+- Dev seeding (creates default users): `POST /auth/seed-defaults`
+  - `admin@example.com / password` (Admin)
+  - `editor@example.com / password` (Editor)
+  - `viewer@example.com / password` (Viewer)
+
+### Login example
+
+```bash
+curl -s -X POST http://localhost:3000/auth/login   -H 'Content-Type: application/json'   -d '{"email":"admin@example.com","password":"password"}'
+```
+
+Response includes a `token` field.
+
+## Endpoints (high level)
+
+- `POST /topics` — create topic (RBAC)
+- `GET /topics/:id` — read topic (RBAC)
+- `PATCH /topics/:id` — update (creates new immutable version) (RBAC)
+- `DELETE /topics/:id` — soft delete (RBAC)
+- `GET /topics/:id/versions` — list versions
+- `GET /topics/:id/tree?version=latest&includeResources=true|false` — tree
+- `POST /resources` / `GET /resources` / `PATCH /resources/:id` / `DELETE /resources/:id` — resources per topic
+- `POST /auth/seed-defaults` — dev only
+- `POST /auth/login` — JWT login
+
+See **Swagger** for full schemas/params.
+
+## Swagger / OpenAPI
+
+- Swagger UI: `GET /docs`
+- OpenAPI JSON: `GET /docs.json`
+
+## Data model (in-memory)
+
+- **Topic**: parent/child (tree), soft delete via `deletedAt`
+- **TopicVersion**: immutable snapshots (`name`, `content`, `version` monotonic per topic)
+- **Resource**: belongs to a topic, soft delete
+- **User**: name, email (normalized to lowercase with TLD validation), role, `passwordHash` (bcrypt)
+
+---
+
+## Tests
+
+### TL;DR
+
+```bash
+# set a test secret
+export JWT_SECRET=test_secret
+
+# run all tests
+npm test
+
+# run with coverage
+npm test -- --coverage
+
+# watch mode
+npm run test:watch
+
+# run a single file
+npm test -- src/tests/integration/topics.int.test.ts
+
+# run a single test by name
+npm test -- -t "builds correct tree structure"
+```
+
+### What’s covered
+
+- **Integration tests** (Express app via Supertest, no real network):
+  - **Auth & RBAC**: login, protected routes, role checks
+  - **Topics**: CRUD, sibling-name uniqueness, soft delete
+  - **Tree**: `GET /topics/:id/tree` with `version=latest|<number>`, `includeResources`
+  - **Versioning**: `GET /topics/:id/versions`, version increments on updates
+  - **Resources**: CRUD and listing by topic, tree includes resources when requested
+  - **Shortest Path** (if enabled): BFS parent/child traversal
+
+- **Unit tests** (pure functions/services):
+  - `TopicVersionFactory` (stable `createdAt`, monotonic versioning)
+  - `AuthService` email normalization & password check (bcrypt)
+  - (And other small services/helpers if present)
+
+> Tests validate that emails include a **TLD** and are normalized to lowercase.  
+> Seeding helpers in tests create the default users when needed.
+
+### Test environment
+
+- Uses **Jest** (TS via ts-jest or transpiled JS depending on your setup).
+- In-memory **LokiJS** database — tests are self-contained and reset between runs.
+- Requires `JWT_SECRET` in the environment (use `.env.test` or export before running).
+
+Example `.env.test`:
+
+```
+JWT_SECRET=test_secret
+PORT=0
+```
+
+Then:
+
+```bash
+# Uses .env.test if your test runner loads it (or export manually as above)
+npm test
+```
+
+### Running tests against a live dev server (optional)
+
+If you want to exercise endpoints manually while the dev server is running:
+
+```bash
+# 1) Start server (in another terminal)
+export JWT_SECRET=change_me
+npm run dev
+
+# 2) Seed defaults (dev only)
+curl -s -X POST http://localhost:3000/auth/seed-defaults -H 'Content-Type: application/json' -d '{}'
+
+# 3) Login as viewer
+viewer_token=$(curl -s -X POST http://localhost:3000/auth/login   -H 'Content-Type: application/json'   -d '{"email":"viewer@example.com","password":"password"}' | jq -r .token)
+
+# 4) Create a root topic
+root=$(curl -s -X POST http://localhost:3000/topics   -H "Authorization: Bearer $viewer_token"   -H 'Content-Type: application/json'   -d '{"name":"RootT","content":"T","parentId":null}')
+
+echo "$root"
+```
+
+> Note: RBAC is enforced; use the appropriate role for each action in your scripts.
 
 ---
 
 ## Docker
 
+**Runtime image (no devDependencies):**
+
+```dockerfile
+# ---- builder ----
+FROM node:18 AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# ---- runtime ----
+FROM node:18-slim AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY --from=builder /app/dist ./dist
+EXPOSE 3000
+CMD ["node", "dist/server.js"]
+```
+
+Build & run:
+
 ```bash
 docker build -t knowledge-base-api .
-docker run -p 3000:3000 --env-file .env knowledge-base-api
+docker run -p 3000:3000 -e JWT_SECRET=change_me knowledge-base-api
 ```
+
+> If you want to run Jest **inside Docker**, run it in the **builder** stage (where devDependencies are installed).
 
 ---
 
-## Data Store
+## Project scripts
 
-No external database is required. The API uses an in‑memory **LokiJS** store that is initialized automatically (no migrations).
-
-To seed default users/roles for local usage:
-```
-POST /auth/seed-defaults
-Body: {}
-```
-
-Example (cURL):
-```bash
-curl -X POST http://localhost:3000/auth/seed-defaults   -H 'Content-Type: application/json'   -d '{}'
-```
+- `npm run dev` — start in watch mode
+- `npm run build` — compile TypeScript to `dist/`
+- `npm start` — run compiled server
+- `npm test` — run tests
+- `npm run test:watch` — jest watch (if defined)
+- `npm run lint` — lint (if configured)
 
 ---
 
-## Authentication
+## Notes
 
-### Default users (seed)
-All users are created with password `password`:
-- `admin@example.com` (Admin)
-- `editor@example.com` (Editor)
-- `viewer@example.com` (Viewer)
-
-> Note: emails are validated with TLD; use domains like `@example.com`.
-
-### Login (JWT)
-```
-POST /auth/login
-{ "email": "<email>", "password": "password" }
-```
-
-Example:
-```bash
-curl -X POST http://localhost:3000/auth/login   -H 'Content-Type: application/json'   -d '{"email":"admin@example.com","password":"password"}'
-```
-
-Response (excerpt):
-```json
-{ "token": "<JWT>" }
-```
-
-Send the token in protected requests:
-```
-Authorization: Bearer <JWT>
-```
-
-Example authenticated request:
-```bash
-TOKEN="<paste_token_here>"
-curl -H "Authorization: Bearer $TOKEN" http://localhost:3000/topics
-```
-
----
-
-## API Documentation
-
-- Swagger UI: `http://localhost:3000/docs`
-- OpenAPI JSON: `http://localhost:3000/openapi.json`
-
+- This is an in-memory API for assessment/demo. For production, swap LokiJS with a real database and persist resources accordingly.
+- `POST /auth/seed-defaults` is **dev-only**; remove or guard it in production.
