@@ -1,26 +1,27 @@
-
-
-
 import { collections, TopicRecord, TopicVersionRecord } from '../db/loki';
-
 import { TopicVersionFactory } from '../../domain/versioning/TopicVersionFactory';
-
 import { randomUUID } from 'crypto';
 
-
 /**
- * TopicRepository class.
- * @class
+ * Repository for managing topics and their versions in the database.
+ * Business rules:
+ * - Topics are organized in a tree structure.
+ * - Supports CRUD operations, versioning and soft delete.
+ * - Sibling topics must have unique names under the same parent.
  */
 export class TopicRepository {
-/**
- * notDeletedFilter method.
- * @param rec - See type for details.
- * @returns See return type.
- */
+  /**
+   * Checks if a topic record is not deleted.
+   * @param rec - TopicRecord to check.
+   * @returns True if not deleted.
+   */
   private notDeletedFilter(rec: TopicRecord) { return !rec.deletedAt; }
 
-  
+  /**
+   * Gets the latest version record for a topic.
+   * @param topicId - Topic id.
+   * @returns TopicVersionRecord or null.
+   */
   private getLatestVersion(topicId: string): TopicVersionRecord | null {
     const v = collections.topic_versions
       .chain()
@@ -28,29 +29,34 @@ export class TopicRepository {
       .simplesort('version', true)
       .limit(1)
       .data()[0];
-  
     return v ?? null;
   }
 
+  /**
+   * Finds siblings with the same name under a parent topic.
+   * Business rule: Sibling names must be unique.
+   * @param parentId - Parent topic id.
+   * @param name - Name to check.
+   * @param exceptId - Optional id to exclude.
+   * @returns Array of TopicRecord.
+   */
   private siblingsWithSameName(parentId: string | null, name: string, exceptId?: string): TopicRecord[] {
     const siblings = collections.topics.find({ parentTopicId: parentId }) as TopicRecord[];
     const filtered = siblings.filter((t: TopicRecord) =>
       this.notDeletedFilter(t) && (!exceptId || t.id !== exceptId)
     );
-  
     return filtered.filter((t: TopicRecord) => {
       const v = this.getLatestVersion(t.id);
-  
       return v?.name === name;
     });
   }
 
-  
-/**
- * createRoot method.
- * @param params - See type for details.
- * @returns See return type.
- */
+  /**
+   * Creates a root topic (no parent).
+   * Business rule: Sibling names must be unique.
+   * @param params - Topic parameters.
+   * @returns Created topic and version.
+   */
   createRoot(params: { id?: string; name: string; content: string }) {
     if (this.siblingsWithSameName(null, params.name).length > 0) {
       throw new Error(`DuplicateSiblingName:${params.name}`);
@@ -61,17 +67,16 @@ export class TopicRepository {
     collections.topics.insert(topic);
     const version: TopicVersionRecord = TopicVersionFactory.createInitial({ topicId: id, name: params.name, content: params.content });
     collections.topic_versions.insert(version);
-  
     return { topic, version };
   }
 
-  
-/**
- * createChild method.
- * @param parentId - See type for details.
- * @param params - See type for details.
- * @returns See return type.
- */
+  /**
+   * Creates a child topic under a parent.
+   * Business rule: Sibling names must be unique.
+   * @param parentId - Parent topic id.
+   * @param params - Topic parameters.
+   * @returns Created topic and version.
+   */
   createChild(parentId: string, params: { id?: string; name: string; content: string }) {
     const parent = collections.topics.findOne({ id: parentId });
     if (!parent || parent.deletedAt) throw new Error('ParentNotFound');
@@ -82,75 +87,69 @@ export class TopicRepository {
     collections.topics.insert(topic);
     const version: TopicVersionRecord = TopicVersionFactory.createInitial({ topicId: id, name: params.name, content: params.content });
     collections.topic_versions.insert(version);
-  
     return { topic, version };
   }
 
-  
-/**
- * getById method.
- * @param id - See type for details.
- * @returns See return type.
- */
+  /**
+   * Gets a topic and its current version by id.
+   * @param id - Topic id.
+   * @returns Object with topic and version, or null.
+   */
   getById(id: string) {
     const topic = collections.topics.findOne({ id });
     if (!topic || topic.deletedAt) return null;
     const version = collections.topic_versions.findOne({ topicId: id, version: topic.currentVersion });
     if (!version) return null;
-  
     return { topic, version };
   }
 
-  
+  /**
+   * Gets a topic record by id.
+   * @param id - Topic id.
+   * @returns TopicRecord or null.
+   */
   getTopicRecord(id: string): TopicRecord | null {
     const topic = collections.topics.findOne({ id });
     if (!topic || topic.deletedAt) return null;
-  
     return topic;
   }
 
-  
-/**
- * listByParent method.
- * @param parentId - See type for details.
- * @returns See return type.
- */
+  /**
+   * Lists topics by parent id, including their current version.
+   * @param parentId - Parent topic id.
+   * @returns Array of topic/version objects.
+   */
   listByParent(parentId: string | null) {
     const topics = (collections.topics.find({ parentTopicId: parentId }) as TopicRecord[])
       .filter((t: TopicRecord) => this.notDeletedFilter(t));
-
-  
     return topics
       .map((t: TopicRecord) => {
         const v = collections.topic_versions.findOne({ topicId: t.id, version: t.currentVersion }) as TopicVersionRecord | null;
-  
         return v ? { topic: t, version: v } : null;
       })
       .filter((x): x is { topic: TopicRecord; version: TopicVersionRecord } => Boolean(x));
   }
 
-  
+  /**
+   * Lists child topic records by parent id.
+   * @param parentId - Parent topic id.
+   * @returns Array of TopicRecord.
+   */
   listChildrenRecords(parentId: string): TopicRecord[] {
-  
     return (collections.topics.find({ parentTopicId: parentId }) as TopicRecord[])
       .filter((t: TopicRecord) => this.notDeletedFilter(t));
   }
 
-  
-/**
- * appendVersion method.
- * @param topicId - See type for details.
- * @param update - See type for details.
- * @returns See return type.
- */
-  appendVersion(topicId: string, update: { name?: string; content?: string }) {
+  /**
+   * Appends a new version to a topic.
+   * Business rule: Sibling names must be unique when updating name.
+   * @param topicId - Topic id.
+   * @param update - Fields to update.
+   * @returns The new TopicVersionRecord or null.
+   */
+  appendVersion(topicId: string, update: { name?: string; content?: string }): TopicVersionRecord | null {
     const topic = collections.topics.findOne({ id: topicId });
     if (!topic || topic.deletedAt) return null;
-/**
- * if method.
- * @param update.name - See type for details.
- * @returns See return type.
- */
     if (update.name) {
       const siblings = this.siblingsWithSameName(topic.parentTopicId, update.name, topicId);
       if (siblings.length > 0) throw new Error(`DuplicateSiblingName:${update.name}`);
@@ -163,30 +162,31 @@ export class TopicRepository {
     topic.currentVersion = next.version;
     topic.updatedAt = now;
     collections.topics.update(topic);
-  
     return next;
   }
 
-  
-/**
- * softDelete method.
- * @param topicId - See type for details.
- * @returns See return type.
- */
-  softDelete(topicId: string) {
+  /**
+   * Soft deletes a topic by id.
+   * Business rule: Sets deletedAt timestamp instead of removing.
+   * @param topicId - Topic id.
+   * @returns True if deleted, false otherwise.
+   */
+  softDelete(topicId: string): boolean {
     const topic = collections.topics.findOne({ id: topicId });
     if (!topic || topic.deletedAt) return false;
     topic.deletedAt = new Date();
     collections.topics.update(topic);
-  
     return true;
   }
 
-  
+  /**
+   * Lists all versions for a topic.
+   * @param topicId - Topic id.
+   * @returns Array of TopicVersionRecord or null.
+   */
   listVersions(topicId: string): TopicVersionRecord[] | null {
     const topic = collections.topics.findOne({ id: topicId });
     if (!topic || topic.deletedAt) return null;
-  
     return collections.topic_versions
       .chain()
       .find({ topicId })
@@ -194,16 +194,23 @@ export class TopicRepository {
       .data();
   }
 
-  
+  /**
+   * Gets a specific version for a topic.
+   * @param topicId - Topic id.
+   * @param version - Version number.
+   * @returns TopicVersionRecord or null.
+   */
   getVersion(topicId: string, version: number): TopicVersionRecord | null {
     const topic = collections.topics.findOne({ id: topicId });
     if (!topic || topic.deletedAt) return null;
-  
     return collections.topic_versions.findOne({ topicId, version }) ?? null;
   }
 
-
-
+  /**
+   * Gets child topic records by parent id.
+   * @param parentId - Parent topic id.
+   * @returns Array of TopicRecord.
+   */
   public getChildren(parentId: string): TopicRecord[] {
     const rows = (collections.topics
       .chain()
@@ -213,17 +220,18 @@ export class TopicRepository {
     return rows;
   }
 
-
-
-
-public latestVersionNumber(topicId: string): number {
-  const v = collections.topic_versions
-    .chain()
-    .find({ topicId })
-    .simplesort('version', true)
-    .limit(1)
-    .data()[0];
-  return v?.version ?? 0;
-}
-
+  /**
+   * Gets the latest version number for a topic.
+   * @param topicId - Topic id.
+   * @returns Latest version number or 0 if none.
+   */
+  public latestVersionNumber(topicId: string): number {
+    const v = collections.topic_versions
+      .chain()
+      .find({ topicId })
+      .simplesort('version', true)
+      .limit(1)
+      .data()[0];
+    return v?.version ?? 0;
+  }
 }
